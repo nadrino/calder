@@ -1,5 +1,6 @@
 import torch
 import uproot
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
@@ -118,6 +119,10 @@ def plot_hist2d(hist2d, xedges, yedges, ax=None, title=None, xlabel=None, ylabel
 
 
 if __name__ == "__main__":
+
+    # set_device("cpu")
+    set_device("mps")
+
     branches = [
         "Pmu",
         "CosThetamu",
@@ -126,30 +131,35 @@ if __name__ == "__main__":
 
     path = "/Users/nadrino/Documents/Work/Output/results/gundam/common/OA2024/ND280/Inputs/Splines/XSecAndNDSyst/P7/v12_Highland_3.22.4/MC_mirrored/run4wMCsplines.root"
 
+    t0 = time.perf_counter()
     arrays = load_root_events(
         path,
         "sample_sum",
         branches,
         selection="SelectedSample == 157",
     )
-
-    print(arrays["Pmu"][:5])
-
-    set_device("mps")
+    t1 = time.perf_counter()
+    print(f"Load from disk: {t1 - t0:.3f} s")
 
     torch_arrays = uproot_to_tensors(arrays)
     print(torch_arrays["Pmu"].shape[0])
     torch_arrays["weight"] = torch.ones(torch_arrays["Pmu"].shape[0])
 
+    t0 = time.perf_counter()
     events = EventTable(torch_arrays)
-    print(events.data)
+    t1 = time.perf_counter()
+    print(f"To device: {t1 - t0:.3f} s")
 
     Pmu_edges = torch.linspace(100, 5000, 101)
     CosThetamu_edges = torch.linspace(0, 1, 101)
 
     # Create and fill 2D histogram
     hist = Histogram(["Pmu", "CosThetamu"], [Pmu_edges, CosThetamu_edges])
+
+    t0 = time.perf_counter()
     hist.fill(events)
+    t1 = time.perf_counter()
+    print(f"Binning: {t1 - t0:.3f} s")
 
     print(hist.hist.shape)  # (50, 30)
     print(hist.hist.device)  # mps:0
