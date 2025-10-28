@@ -1,6 +1,8 @@
 import torch
 import uproot
 import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 
 from calder.core.samples.event import EventTable
 from calder.core.samples.histogram import Histogram
@@ -70,6 +72,51 @@ def load_root_events(
         return arrays
 
 
+def plot_flat_histogram(hist, ax=None, title=None, xlabel="Bin index", ylabel="Entries", **kwargs):
+    """Plot a flattened (1D) view of an nD histogram.
+    Useful for debugging binning or visualizing generic histograms."""
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
+
+    # Move data to CPU and flatten
+    if isinstance(hist, torch.Tensor):
+        y = hist.detach().flatten().cpu().numpy()
+    elif isinstance(hist, dict) and "hist" in hist:
+        y = hist["hist"].detach().flatten().cpu().numpy()
+    else:
+        y = hist
+
+    x = range(len(y))
+    ax.step(x, y, where="mid", **kwargs)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    return ax
+
+
+def plot_hist2d(hist2d, xedges, yedges, ax=None, title=None, xlabel=None, ylabel=None, cmap="viridis", **kwargs):
+    """Plot a 2D histogram."""
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
+
+    H = hist2d.detach().cpu().numpy() if isinstance(hist2d, torch.Tensor) else hist2d
+    X = xedges.detach().cpu().numpy()
+    Y = yedges.detach().cpu().numpy()
+    
+
+    mesh = ax.pcolormesh(X, Y, H.T, cmap=cmap, shading="auto", norm=LogNorm(), **kwargs)
+    plt.colorbar(mesh, ax=ax, label="Entries")
+    ax.set_xlabel(xlabel or "x")
+    ax.set_ylabel(ylabel or "y")
+    if title:
+        ax.set_title(title)
+    plt.tight_layout()
+    return ax
+
+
 if __name__ == "__main__":
     branches = [
         "Pmu",
@@ -97,8 +144,8 @@ if __name__ == "__main__":
     events = EventTable(torch_arrays)
     print(events.data)
 
-    Pmu_edges = torch.linspace(0, 10, 101)
-    CosThetamu_edges = torch.linspace(-1, 1, 101)
+    Pmu_edges = torch.linspace(100, 5000, 101)
+    CosThetamu_edges = torch.linspace(0, 1, 101)
 
     # Create and fill 2D histogram
     hist = Histogram(["Pmu", "CosThetamu"], [Pmu_edges, CosThetamu_edges])
@@ -107,5 +154,7 @@ if __name__ == "__main__":
     print(hist.hist.shape)  # (50, 30)
     print(hist.hist.device)  # mps:0
 
+    # plot_flat_histogram(hist.hist, title="hist", xlabel="bin index", ylabel="counts")
 
-
+    plot_hist2d(hist.hist, Pmu_edges, CosThetamu_edges, title="2D hist", xlabel="Pmu [GeV]", ylabel="CosThetamu")
+    plt.show()
