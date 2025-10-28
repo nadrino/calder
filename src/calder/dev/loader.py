@@ -1,7 +1,9 @@
 import torch
 import uproot
 import numpy as np
+
 from calder.core.samples.event import EventTable
+from calder.core.samples.histogram import Histogram
 from calder.core.globals.device import set_device
 
 
@@ -87,7 +89,23 @@ if __name__ == "__main__":
     print(arrays["Pmu"][:5])
 
     set_device("mps")
-    events = EventTable(uproot_to_tensors(arrays))
+
+    torch_arrays = uproot_to_tensors(arrays)
+    print(torch_arrays["Pmu"].shape[0])
+    torch_arrays["weight"] = torch.ones(torch_arrays["Pmu"].shape[0])
+
+    events = EventTable(torch_arrays)
     print(events.data)
+
+    Pmu_edges = torch.linspace(0, 10, 101)
+    CosThetamu_edges = torch.linspace(-1, 1, 101)
+
+    # Create and fill 2D histogram
+    hist = Histogram(["Pmu", "CosThetamu"], [Pmu_edges, CosThetamu_edges])
+    hist.fill(events)
+
+    print(hist.hist.shape)  # (50, 30)
+    print(hist.hist.device)  # mps:0
+
 
 
