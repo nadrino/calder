@@ -3,7 +3,7 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "nu-waves"
+name = "calder"
 version = "0.0.0"  # keep in sync with src/calder/version.py unless you switch to dynamic
 description = "Python library that aims to perform optimised custom parametrisations."
 readme = "README.md"
