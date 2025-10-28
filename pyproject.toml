@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nu-waves"
+version = "0.0.0"  # keep in sync with src/calder/version.py unless you switch to dynamic
+description = "Python library that aims to perform optimised custom parametrisations."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "LGPL-2.1-or-later" }
+authors = [{ name = "Nadrino" }]
+keywords = ["parametrisation", "engine", "physics", "energy", "statistics"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: GNU Lesser General Public License v2 or later (LGPLv2+)",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Physics",
+  "Typing :: Typed",
+]
+dependencies = [
+  "torch>=2.0",
+]
+
+[project.optional-dependencies]
+plot = [
+    "matplotlib>=3.7"
+]
+# CI will install: `pip install .[dev]`
+dev = [
+    "pytest",
+    "pytest-cov"
+]
+
+
+[project.urls]
+Homepage = "https://github.com/nadrino/neutrino-interferometry"
+Issues   = "https://github.com/nadrino/neutrino-interferometry/issues"
+
+[tool.hatch.build.targets.sdist]
+include = ["src/calder", "README.md", "LICENSE"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/calder"]
