@@ -50,7 +50,7 @@ def uproot_to_tensors(arrays) -> dict[str, torch.Tensor]:
 
 
 def load_root_events(
-    file_path: str,
+    files: list[str],
     tree_name: str,
     branches: list[str],
     selection: str | None = None,
@@ -66,6 +66,14 @@ def load_root_events(
             device="cuda"
         )
     """
+
+    return uproot.concatenate(
+        [f"{f}:{tree_name}" for f in files],
+        cut=selection,
+        filter_name=branches,
+        library="np",
+    )
+
     with uproot.open(file_path) as f:
         tree = f[tree_name]
         arrays = tree.arrays(branches, cut=selection, library="np")
@@ -129,14 +137,17 @@ if __name__ == "__main__":
         "ReactionCode"
     ]
 
-    path = "/Users/nadrino/Documents/Work/Output/results/gundam/common/OA2024/ND280/Inputs/Splines/XSecAndNDSyst/P7/v12_Highland_3.22.4/MC_mirrored/run4wMCsplines.root"
+    files = [
+        "/Users/nadrino/Documents/Work/Output/results/gundam/common/OA2024/ND280/Inputs/Splines/XSecAndNDSyst/P7/v12_Highland_3.22.4/MC_mirrored/run4wMCsplines.root",
+        "/Users/nadrino/Documents/Work/Output/results/gundam/common/OA2024/ND280/Inputs/Splines/XSecAndNDSyst/P7/v12_Highland_3.22.4/MC_mirrored/run5MCsplines.root",
+    ]
 
     t0 = time.perf_counter()
     arrays = load_root_events(
-        path,
+        files,
         "sample_sum",
         branches,
-        selection="SelectedSample == 157",
+        # selection="SelectedSample == 157",
     )
     t1 = time.perf_counter()
     print(f"Load from disk: {t1 - t0:.3f} s")
