@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 
-from calder.core.samples.event import EventTable
+from calder.core.samples.dataset import EventTable
 from calder.core.samples.histogram import Histogram
 from calder.core.globals.device import set_device
 
