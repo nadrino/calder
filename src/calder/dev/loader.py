@@ -161,8 +161,8 @@ if __name__ == "__main__":
     t1 = time.perf_counter()
     print(f"To device: {t1 - t0:.3f} s")
 
-    Pmu_edges = torch.linspace(100, 5000, 101)
-    CosThetamu_edges = torch.linspace(0, 1, 101)
+    Pmu_edges = torch.linspace(100, 5000, 51)
+    CosThetamu_edges = torch.linspace(0, 1, 51)
 
     # Create and fill 2D histogram
     hist = Histogram(["Pmu", "CosThetamu"], [Pmu_edges, CosThetamu_edges])
@@ -226,6 +226,118 @@ if __name__ == "__main__":
         return torch.stack([h_p, h_c])
 
 
+    import math
+    import torch
+
+
+    def logpdf_kde_batched_hist_ref(
+          x_data_dict,  # dict {"Pmu": tensor(N,), "CosThetamu": tensor(N,)}
+          x_mc_dict,  # dict {"Pmu": {"data": tensor(M,)}, "CosThetamu": {"data": tensor(M,)}}
+          w_mc,  # tensor (M,)
+          hist_ref,
+          # dict with {"edges":[edges_Pmu, edges_CosThetamu], "counts":..., optional "h_vec":..., "alpha":...}
+          batch_size=1200,
+    ):
+        """
+        Returns log PDF values at x_data points using a KDE corrected by the
+        reference histogram (hist_ref).
+        """
+
+        # --------------------------------------------------
+        # Stack variables in fixed order
+        # --------------------------------------------------
+        vars_order = ["Pmu", "CosThetamu"]
+        x_data = torch.stack([x_data_dict[v].flatten() for v in vars_order], dim=1)
+        x_mc = torch.stack([x_mc_dict[v]["data"].flatten() for v in vars_order], dim=1)
+
+        device = x_mc.device
+        dtype = x_mc.dtype
+        eps = torch.tensor(1e-12, device=device, dtype=dtype)
+
+        N, d = x_data.shape
+        M = x_mc.shape[0]
+
+        assert d == len(vars_order)
+        assert w_mc.shape[0] == M
+
+        # --------------------------------------------------
+        # Bandwidths h_vec (if not provided)
+        # --------------------------------------------------
+        h_vec = hist_ref.get("h_vec", None)
+        if h_vec is None:
+            W = w_mc.sum().clamp_min(eps)
+            mean = (w_mc[:, None] * x_mc).sum(0) / W
+            var = (w_mc[:, None] * (x_mc - mean) ** 2).sum(0) / W
+            std = torch.sqrt(var.clamp_min(1e-24))
+            n_eff = (W * W) / (w_mc.pow(2).sum().clamp_min(eps))
+            h_vec = std * torch.pow(n_eff, -1.0 / (d + 4.0))
+        h_vec = h_vec.to(device=device, dtype=dtype).clamp_min(torch.finfo(dtype).eps)
+
+        # --------------------------------------------------
+        # Core batched KDE log-density
+        # --------------------------------------------------
+        log_den = torch.log(w_mc.sum().clamp_min(eps))
+        log_norm = -0.5 * d * math.log(2.0 * math.pi) - torch.log(h_vec).sum()
+
+        out_chunks = []
+        for i in range(0, N, batch_size):
+            xb = x_data[i:i + batch_size]  # (B, d)
+            diff = xb[:, None, :] - x_mc[None, :, :]  # (B, M, d)
+            quad = (diff * diff / (h_vec * h_vec)).sum(-1)  # (B, M)
+            logk = log_norm - 0.5 * quad
+            log_num = torch.logsumexp(torch.log(w_mc.clamp_min(eps)) + logk, dim=1)
+            out_chunks.append(log_num - log_den)
+        logpdf_kde = torch.cat(out_chunks, dim=0)
+
+        # --------------------------------------------------
+        # Histogram-based multiplicative correction
+        # --------------------------------------------------
+        edges = [e.to(device=device, dtype=dtype) for e in hist_ref["edges"]]
+        y_grid = hist_ref["counts"].to(device=device, dtype=dtype)
+        y_tot = y_grid.sum().clamp_min(eps)
+        y_frac = y_grid / y_tot
+
+        sqrt2 = math.sqrt(2.0)
+        mass_per_dim = []
+        for k in range(d):
+            ek = edges[k].contiguous()  # (B_k+1,)
+            z = (ek[None, :] - x_mc[:, k:k + 1]) / h_vec[k]
+            cdf = 0.5 * (1.0 + torch.erf(z / sqrt2))
+            mk = (cdf[:, 1:] - cdf[:, :-1]).clamp_min(0.0)
+            mass_per_dim.append(mk)
+
+        letters = "abcdefghijklmnopqrstuvwxyz"
+        in_spec = ["m"] + [f"m{letters[i]}" for i in range(d)]
+        out_spec = "".join([letters[i] for i in range(d)])
+        eq = ",".join(in_spec) + "->" + out_spec
+        tensors = [w_mc] + mass_per_dim
+        mu_grid_w = torch.einsum(eq, *tensors)
+        W = w_mc.sum().clamp_min(eps)
+        mu_grid = (mu_grid_w / W).contiguous()
+
+        alpha = float(hist_ref.get("alpha", 1e-12))
+        r_grid = (y_frac + alpha) / (mu_grid + alpha)
+        Z = (r_grid * mu_grid).sum().clamp_min(eps)
+
+        # --------------------------------------------------
+        # Evaluate r(x) = r(bin) for each data point
+        # --------------------------------------------------
+        idxs = []
+        for k in tqdm(range(d)):
+            ek = edges[k]
+            idx = torch.bucketize(x_data[:, k], ek, right=False) - 1
+            idx = idx.clamp(min=0, max=ek.numel() - 2)
+            idxs.append(idx)
+
+        if d == 2:
+            r_vals = r_grid[idxs[0], idxs[1]]
+        else:
+            r_vals = r_grid[tuple(idxs)]
+
+        log_correction = torch.log(r_vals.clamp_min(eps)) - torch.log(Z)
+        return logpdf_kde + log_correction
+
+
     def logpdf_kde_batched_raw(x_data_dict, x_mc_dict, w_mc, h_vec, batch_size=1500):
         # stack without standardization
         def stack_from_dict(x_data_dict, x_mc_dict):
@@ -266,8 +378,8 @@ if __name__ == "__main__":
     }
     w_mc = torch.ones(M, device=events["Pmu"].device)
 
-    p_grid = torch.linspace(100, 5000, 101, device=events["Pmu"].device)
-    ct_grid = torch.linspace(0.0, 1.0, 101, device=events["Pmu"].device)
+    p_grid = torch.linspace(100, 5000, 201, device=events["Pmu"].device)
+    ct_grid = torch.linspace(0.0, 1.0, 201, device=events["Pmu"].device)
     P, C = torch.meshgrid(p_grid, ct_grid, indexing="xy")
 
     # Dictionnaire x_data pour évaluer la PDF sur la grille
@@ -285,7 +397,7 @@ if __name__ == "__main__":
 
     h_vec = robust_bandwidths(x_mc)  # tensor([h_p, h_c]) on the same device/dtype
     log_f = logpdf_kde_batched_raw(x_data, x_mc, w_mc, h_vec, batch_size=1200)
-    f = torch.exp(log_f).reshape(P.shape)
+    # f = torch.exp(log_f).reshape(P.shape)
 
     # log_f = logpdf_kde_from_dict_batched(x_data, x_mc, w_mc)
     # f = torch.exp(log_f).reshape(P.shape)
@@ -300,6 +412,29 @@ if __name__ == "__main__":
     # plt.legend()
     # plt.tight_layout()
     # plt.show()
+
+    # Optionally, define per-dim bandwidths (for example, pre-determined)
+    h_vec = torch.tensor([200.0, 0.02])  # in same units as your observables
+
+    # Put everything into a dict
+    hist_ref = {
+        "edges": [Pmu_edges, CosThetamu_edges],
+        "counts": hist.hist,
+        "h_vec": h_vec,  # optional; can be omitted if you want auto bandwidth
+        "alpha": 1e-6  # small pseudo-count to stabilize ratios
+    }
+
+    print("Calculating PDF")
+    logpdf = logpdf_kde_batched_hist_ref(
+        x_data,  # (N, 2)
+        x_mc,  # (M, 2)
+        w_mc,  # (M,)
+        hist_ref,
+        batch_size=1200,
+    )
+
+    print("EXP")
+    f = torch.exp(logpdf).reshape(P.shape)
 
     print("to cpu...")
     P = P.cpu()
