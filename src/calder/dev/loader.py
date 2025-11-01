@@ -1,6 +1,7 @@
 import torch
 import uproot
 import time
+from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
@@ -8,6 +9,7 @@ from matplotlib.colors import LogNorm
 from calder.core.samples.dataset import EventTable
 from calder.core.samples.histogram import Histogram
 from calder.core.globals.device import set_device
+import calder.utils.style
 
 
 def uproot_to_tensors(arrays) -> dict[str, torch.Tensor]:
@@ -106,7 +108,7 @@ def plot_flat_histogram(hist, ax=None, title=None, xlabel="Bin index", ylabel="E
     return ax
 
 
-def plot_hist2d(hist2d, xedges, yedges, ax=None, title=None, xlabel=None, ylabel=None, cmap="viridis", **kwargs):
+def plot_hist2d(hist2d, xedges, yedges, ax=None, title=None, xlabel=None, ylabel=None, cmap="magma", **kwargs):
     """Plot a 2D histogram."""
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
@@ -114,8 +116,6 @@ def plot_hist2d(hist2d, xedges, yedges, ax=None, title=None, xlabel=None, ylabel
     H = hist2d.detach().cpu().numpy() if isinstance(hist2d, torch.Tensor) else hist2d
     X = xedges.detach().cpu().numpy()
     Y = yedges.detach().cpu().numpy()
-    
-
     mesh = ax.pcolormesh(X, Y, H.T, cmap=cmap, shading="auto", norm=LogNorm(), **kwargs)
     plt.colorbar(mesh, ax=ax, label="Entries")
     ax.set_xlabel(xlabel or "x")
@@ -179,3 +179,152 @@ if __name__ == "__main__":
 
     plot_hist2d(hist.hist, Pmu_edges, CosThetamu_edges, title="2D hist", xlabel="Pmu [GeV]", ylabel="CosThetamu")
     plt.show()
+
+    import torch
+    import math
+    import matplotlib.pyplot as plt
+
+
+    # ============================================================
+    # 1. Fonctions KDE et utilitaires depuis ton dictionnaire
+    # ============================================================
+
+    def stack_from_dict(x_data_dict, x_mc_dict):
+        varnames = list(x_mc_dict.keys())
+        x_mc_list = []
+        x_data_list = []
+        h_vec = []
+        mu_vec = []
+        std_vec = []
+        for v in varnames:
+            x_mc_list.append(x_mc_dict[v]["data"])
+            x_data_list.append(x_data_dict[v])
+            h_vec.append(x_mc_dict[v]["h"])
+            mu_vec.append(x_mc_dict[v]["mean"])
+            std_vec.append(x_mc_dict[v]["std"])
+        x_mc = torch.stack(x_mc_list, dim=1)
+        x_data = torch.stack(x_data_list, dim=1)
+        h_vec = torch.tensor(h_vec, dtype=x_mc.dtype, device=x_mc.device)
+        mu_vec = torch.tensor(mu_vec, dtype=x_mc.dtype, device=x_mc.device)
+        std_vec = torch.tensor(std_vec, dtype=x_mc.dtype, device=x_mc.device)
+        return x_data, x_mc, h_vec, mu_vec, std_vec
+
+
+    import torch, math
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+
+
+    def robust_bandwidths(x_mc_dict, fp=0.05, fc=0.08):
+        p = x_mc_dict["Pmu"]["data"].flatten()
+        c = x_mc_dict["CosThetamu"]["data"].flatten()
+        p05, p95 = torch.quantile(p, 0.05), torch.quantile(p, 0.95)
+        c05, c95 = torch.quantile(c, 0.05), torch.quantile(c, 0.95)
+        h_p = fp * (p95 - p05)  # e.g. 5% of central 90% range
+        h_c = fc * (c95 - c05)  # e.g. 8% of central 90% range
+        return torch.stack([h_p, h_c])
+
+
+    def logpdf_kde_batched_raw(x_data_dict, x_mc_dict, w_mc, h_vec, batch_size=1500):
+        # stack without standardization
+        def stack_from_dict(x_data_dict, x_mc_dict):
+            vars_order = ["Pmu", "CosThetamu"]
+            x_mc = torch.stack([x_mc_dict[v]["data"].flatten() for v in vars_order], dim=1)
+            x_dt = torch.stack([x_data_dict[v].flatten() for v in vars_order], dim=1)
+            return x_dt, x_mc
+
+        x_data, x_mc = stack_from_dict(x_data_dict, x_mc_dict)
+        eps = 1e-12
+        N, d = x_data.shape
+        log_den = torch.log(w_mc.sum() + eps)
+        log_norm = -0.5 * d * math.log(2 * math.pi) - torch.log(h_vec).sum()
+
+        out = []
+        for i in tqdm(range(0, N, batch_size)):
+            xb = x_data[i:i + batch_size]  # (B, d)
+            diff = xb[:, None, :] - x_mc[None, :, :]  # (B, M, d)
+            quad = (diff ** 2 / (h_vec * h_vec)).sum(-1)  # (B, M)
+            logk = log_norm - 0.5 * quad
+            log_num = torch.logsumexp(torch.log(w_mc + eps) + logk, dim=1)
+            out.append(log_num - log_den)
+        return torch.cat(out, dim=0)
+
+
+    # # Example usage with your grid
+    # # Choose balanced bandwidths
+    # h_vec = robust_bandwidths(x_mc)  # tensor([h_p, h_c]) on the same device/dtype
+    # log_f = logpdf_kde_batched_raw(x_data, x_mc, w_mc, h_vec, batch_size=1200)
+    # f = torch.exp(log_f).reshape(P.shape)
+
+    M = events["Pmu"].shape[0]
+    x_mc = {
+        "Pmu":
+            {"data": events["Pmu"], "mean":  events["Pmu"].mean(), "std":  events["Pmu"].std(), "h":  events["Pmu"].std() * M ** (-1 / 6)},
+        "CosThetamu":
+            {"data": events["CosThetamu"], "mean": events["CosThetamu"].mean(), "std": events["CosThetamu"].std(), "h": events["CosThetamu"].std() * M ** (-1 / 6)}
+    }
+    w_mc = torch.ones(M, device=events["Pmu"].device)
+
+    p_grid = torch.linspace(100, 5000, 101, device=events["Pmu"].device)
+    ct_grid = torch.linspace(0.0, 1.0, 101, device=events["Pmu"].device)
+    P, C = torch.meshgrid(p_grid, ct_grid, indexing="xy")
+
+    # Dictionnaire x_data pour évaluer la PDF sur la grille
+    x_data = {
+        "Pmu": P.flatten(),
+        "CosThetamu": C.flatten()
+    }
+
+    # print(x_mc["Pmu"]["data"])
+    x_mc["Pmu"]["data"] = x_mc["Pmu"]["data"].flatten()
+    x_mc["CosThetamu"]["data"] = x_mc["CosThetamu"]["data"].flatten()
+    x_mc_check = torch.stack([x_mc["Pmu"]["data"], x_mc["CosThetamu"]["data"]], dim=1)
+    x_data_check = torch.stack([x_data["Pmu"], x_data["CosThetamu"]], dim=1)
+    print("x_mc:", x_mc_check.shape, "x_data:", x_data_check.shape)
+
+    h_vec = robust_bandwidths(x_mc)  # tensor([h_p, h_c]) on the same device/dtype
+    log_f = logpdf_kde_batched_raw(x_data, x_mc, w_mc, h_vec, batch_size=1200)
+    f = torch.exp(log_f).reshape(P.shape)
+
+    # log_f = logpdf_kde_from_dict_batched(x_data, x_mc, w_mc)
+    # f = torch.exp(log_f).reshape(P.shape)
+
+    # plt.figure(figsize=(7, 5), dpi=130)
+    # plt.pcolormesh(P.to("cpu"), C.to("cpu"), f.to("cpu"), shading="auto", cmap="magma")
+    # # plt.scatter(p_mu, cos_theta, s=6, c="white", edgecolors="k", lw=0.2, label="MC events")
+    # plt.xlabel(r"$p_\mu$ [MeV]")
+    # plt.ylabel(r"$\cos\theta_\mu$")
+    # plt.title("PDF 2D KDE (pondérée)")
+    # plt.colorbar(label="f(p_mu, cos_theta_mu)")
+    # plt.legend()
+    # plt.tight_layout()
+    # plt.show()
+
+    print("to cpu...")
+    P = P.cpu()
+    C = C.cpu()
+    f = f.cpu()
+
+    f *= torch_arrays["Pmu"].shape[0]
+
+    print("plotting...")
+    # Plot in log scale so structure is visible
+    plt.figure(figsize=(6, 5), dpi=150)
+    plt.pcolormesh(P, C, np.clip(f.numpy(), 1e-12, None),
+                   shading="auto", cmap="magma",
+                   norm=LogNorm(
+                       vmin=1,
+                       # vmax=float(f.max())
+                   )
+                   )
+    # plt.scatter(x_mc["Pmu"]["data"].cpu(), x_mc["CosThetamu"]["data"].cpu(),
+    #             s=4, c="white", edgecolors="k", lw=0.2, alpha=0.6)
+    plt.xlabel("p_mu [MeV]")
+    plt.ylabel("cos_theta_mu")
+    plt.title("PDF 2D KDE (weighted, per-dim bandwidths)")
+    plt.colorbar(label="f(p_mu, cos_theta_mu)")
+    plt.tight_layout()
+    plt.show()
+
+
