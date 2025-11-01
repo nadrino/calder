@@ -108,6 +108,7 @@ def plot_flat_histogram(hist, ax=None, title=None, xlabel="Bin index", ylabel="E
     return ax
 
 
+max_hist = None
 def plot_hist2d(hist2d, xedges, yedges, ax=None, title=None, xlabel=None, ylabel=None, cmap="magma", **kwargs):
     """Plot a 2D histogram."""
     if ax is None:
@@ -116,7 +117,9 @@ def plot_hist2d(hist2d, xedges, yedges, ax=None, title=None, xlabel=None, ylabel
     H = hist2d.detach().cpu().numpy() if isinstance(hist2d, torch.Tensor) else hist2d
     X = xedges.detach().cpu().numpy()
     Y = yedges.detach().cpu().numpy()
-    mesh = ax.pcolormesh(X, Y, H.T, cmap=cmap, shading="auto", norm=LogNorm(), **kwargs)
+    global max_hist
+    max_hist = np.max(H.T)
+    mesh = ax.pcolormesh(X, Y, H.T, cmap=cmap, shading="auto", norm=LogNorm(vmin=1, vmax=max_hist), **kwargs)
     plt.colorbar(mesh, ax=ax, label="Entries")
     ax.set_xlabel(xlabel or "x")
     ax.set_ylabel(ylabel or "y")
@@ -229,23 +232,82 @@ if __name__ == "__main__":
     import math
     import torch
 
+    import math
+    import torch
+    import torch.nn.functional as F
+
+
+    def _gauss_kernel_1d(sigma, device, dtype):
+        # sigma in "bins". radius ~ 3 sigma
+        if sigma <= 0:
+            return None
+        radius = int(math.ceil(3.0 * float(sigma)))
+        xs = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+        k = torch.exp(-0.5 * (xs / float(sigma)) ** 2)
+        k = k / k.sum().clamp_min(torch.finfo(dtype).eps)
+        return k
+
+
+    def _smooth_grid_separable_2d(grid, sigma_y, sigma_x):
+        # grid shape (H, W), reflect padding, separable Gaussian
+        H, W = grid.shape
+        x = grid[None, None, :, :]  # NCHW
+        if sigma_y and sigma_y > 0:
+            ky = _gauss_kernel_1d(sigma_y, grid.device, grid.dtype)
+            pad = ky.numel() // 2
+            x = F.pad(x, (0, 0, pad, pad), mode="reflect")
+            x = F.conv2d(x, ky.view(1, 1, -1, 1))
+        if sigma_x and sigma_x > 0:
+            kx = _gauss_kernel_1d(sigma_x, grid.device, grid.dtype)
+            pad = kx.numel() // 2
+            x = F.pad(x, (pad, pad, 0, 0), mode="reflect")
+            x = F.conv2d(x, kx.view(1, 1, 1, -1))
+        return x[0, 0]
+
+
+    def _interp_r_multilinear_2d(r_grid, centers, x):
+        # r_grid shape (B0, B1) defined at bin centers
+        # centers: [c0 (B0,), c1 (B1,)]
+        # x: (N,2) values in data units
+        c0, c1 = centers
+        N = x.shape[0]
+        eps = torch.finfo(x.dtype).eps
+
+        # locate neighbors in index space of centers
+        i1 = torch.bucketize(x[:, 0].contiguous(), c0)  # in [0..B0]
+        j1 = torch.bucketize(x[:, 1].contiguous(), c1)  # in [0..B1]
+        i0 = (i1 - 1).clamp(0, c0.numel() - 1)
+        j0 = (j1 - 1).clamp(0, c1.numel() - 1)
+        i1 = i1.clamp(0, c0.numel() - 1)
+        j1 = j1.clamp(0, c1.numel() - 1)
+
+        c0_i0 = c0[i0]
+        c0_i1 = c0[i1]
+        c1_j0 = c1[j0]
+        c1_j1 = c1[j1]
+
+        t0 = (x[:, 0] - c0_i0) / (c0_i1 - c0_i0).clamp_min(eps)
+        t1 = (x[:, 1] - c1_j0) / (c1_j1 - c1_j0).clamp_min(eps)
+        t0 = t0.clamp(0.0, 1.0)
+        t1 = t1.clamp(0.0, 1.0)
+
+        r00 = r_grid[i0, j0]
+        r10 = r_grid[i1, j0]
+        r01 = r_grid[i0, j1]
+        r11 = r_grid[i1, j1]
+
+        r = (1 - t0) * (1 - t1) * r00 + t0 * (1 - t1) * r10 + (1 - t0) * t1 * r01 + t0 * t1 * r11
+        return r
+
 
     def logpdf_kde_batched_hist_ref(
-          x_data_dict,  # dict {"Pmu": tensor(N,), "CosThetamu": tensor(N,)}
-          x_mc_dict,  # dict {"Pmu": {"data": tensor(M,)}, "CosThetamu": {"data": tensor(M,)}}
-          w_mc,  # tensor (M,)
-          hist_ref,
-          # dict with {"edges":[edges_Pmu, edges_CosThetamu], "counts":..., optional "h_vec":..., "alpha":...}
+          x_data_dict,  # {"Pmu": tensor(N,), "CosThetamu": tensor(N,)}
+          x_mc_dict,  # {"Pmu": {"data": tensor(M,)}, "CosThetamu": {"data": tensor(M,)}}
+          w_mc,  # (M,)
+          hist_ref,  # {"edges":[eP,eC], "counts": H, opt: "h_vec","alpha","smooth_sigma_bins","smooth_log"}
           batch_size=1200,
     ):
-        """
-        Returns log PDF values at x_data points using a KDE corrected by the
-        reference histogram (hist_ref).
-        """
-
-        # --------------------------------------------------
-        # Stack variables in fixed order
-        # --------------------------------------------------
+        # stack in fixed order
         vars_order = ["Pmu", "CosThetamu"]
         x_data = torch.stack([x_data_dict[v].flatten() for v in vars_order], dim=1)
         x_mc = torch.stack([x_mc_dict[v]["data"].flatten() for v in vars_order], dim=1)
@@ -256,13 +318,10 @@ if __name__ == "__main__":
 
         N, d = x_data.shape
         M = x_mc.shape[0]
-
-        assert d == len(vars_order)
+        assert d == 2, "This version is written for 2D. Extend similarly for >2D if needed."
         assert w_mc.shape[0] == M
 
-        # --------------------------------------------------
-        # Bandwidths h_vec (if not provided)
-        # --------------------------------------------------
+        # bandwidths
         h_vec = hist_ref.get("h_vec", None)
         if h_vec is None:
             W = w_mc.sum().clamp_min(eps)
@@ -273,68 +332,72 @@ if __name__ == "__main__":
             h_vec = std * torch.pow(n_eff, -1.0 / (d + 4.0))
         h_vec = h_vec.to(device=device, dtype=dtype).clamp_min(torch.finfo(dtype).eps)
 
-        # --------------------------------------------------
-        # Core batched KDE log-density
-        # --------------------------------------------------
+        # KDE core
         log_den = torch.log(w_mc.sum().clamp_min(eps))
         log_norm = -0.5 * d * math.log(2.0 * math.pi) - torch.log(h_vec).sum()
 
-        out_chunks = []
-        for i in range(0, N, batch_size):
-            xb = x_data[i:i + batch_size]  # (B, d)
-            diff = xb[:, None, :] - x_mc[None, :, :]  # (B, M, d)
-            quad = (diff * diff / (h_vec * h_vec)).sum(-1)  # (B, M)
+        out = []
+        for i in tqdm(range(0, N, batch_size)):
+            xb = x_data[i:i + batch_size]
+            diff = xb[:, None, :] - x_mc[None, :, :]  # (B,M,2)
+            quad = (diff * diff / (h_vec * h_vec)).sum(-1)  # (B,M)
             logk = log_norm - 0.5 * quad
             log_num = torch.logsumexp(torch.log(w_mc.clamp_min(eps)) + logk, dim=1)
-            out_chunks.append(log_num - log_den)
-        logpdf_kde = torch.cat(out_chunks, dim=0)
+            out.append(log_num - log_den)
+        logpdf_kde = torch.cat(out, dim=0)
 
-        # --------------------------------------------------
-        # Histogram-based multiplicative correction
-        # --------------------------------------------------
+        # histogram-based correction
         edges = [e.to(device=device, dtype=dtype) for e in hist_ref["edges"]]
         y_grid = hist_ref["counts"].to(device=device, dtype=dtype)
         y_tot = y_grid.sum().clamp_min(eps)
         y_frac = y_grid / y_tot
 
+        # integral of KDE over each ref bin (analytic Gaussian CDF diffs)
         sqrt2 = math.sqrt(2.0)
         mass_per_dim = []
-        for k in range(d):
-            ek = edges[k].contiguous()  # (B_k+1,)
-            z = (ek[None, :] - x_mc[:, k:k + 1]) / h_vec[k]
+        for k in tqdm(range(d)):
+            ek = edges[k].contiguous()
+            z = (ek[None, :] - x_mc[:, k:k + 1]) / h_vec[k]  # (M,Bk+1)
             cdf = 0.5 * (1.0 + torch.erf(z / sqrt2))
-            mk = (cdf[:, 1:] - cdf[:, :-1]).clamp_min(0.0)
+            mk = (cdf[:, 1:] - cdf[:, :-1]).clamp_min(0.0)  # (M,Bk)
             mass_per_dim.append(mk)
 
         letters = "abcdefghijklmnopqrstuvwxyz"
         in_spec = ["m"] + [f"m{letters[i]}" for i in range(d)]
         out_spec = "".join([letters[i] for i in range(d)])
         eq = ",".join(in_spec) + "->" + out_spec
-        tensors = [w_mc] + mass_per_dim
-        mu_grid_w = torch.einsum(eq, *tensors)
+        mu_grid_w = torch.einsum(eq, w_mc, *mass_per_dim)  # weighted counts per bin
         W = w_mc.sum().clamp_min(eps)
-        mu_grid = (mu_grid_w / W).contiguous()
+        mu_grid = (mu_grid_w / W).contiguous()  # prob per bin
 
         alpha = float(hist_ref.get("alpha", 1e-12))
-        r_grid = (y_frac + alpha) / (mu_grid + alpha)
+        r_grid = (y_frac + alpha) / (mu_grid + alpha)  # per-bin ratio
+
+        # optional smoothing of r_grid on the grid to remove blocky squares
+        # choose smoothing in log space for stability
+        smooth_log = bool(hist_ref.get("smooth_log", True))
+        sigma = hist_ref.get("smooth_sigma_bins", 1.0)  # in bins; float or (sy, sx)
+        if isinstance(sigma, (list, tuple)):
+            sy, sx = float(sigma[0]), float(sigma[1])
+        else:
+            sy = sx = float(sigma)
+
+        if sy > 0 or sx > 0:
+            if smooth_log:
+                r_work = torch.log((r_grid).clamp_min(float(alpha)))
+                r_s = _smooth_grid_separable_2d(r_work, sy, sx).exp()
+            else:
+                r_s = _smooth_grid_separable_2d(r_grid, sy, sx)
+            r_grid = r_s
+
+        # renormalize so that integral of r * mu is 1
         Z = (r_grid * mu_grid).sum().clamp_min(eps)
 
-        # --------------------------------------------------
-        # Evaluate r(x) = r(bin) for each data point
-        # --------------------------------------------------
-        idxs = []
-        for k in tqdm(range(d)):
-            ek = edges[k]
-            idx = torch.bucketize(x_data[:, k], ek, right=False) - 1
-            idx = idx.clamp(min=0, max=ek.numel() - 2)
-            idxs.append(idx)
+        # smooth interpolation of r(x) using bin centers
+        centers = [0.5 * (e[:-1] + e[1:]) for e in edges]  # shape (B0,), (B1,)
+        r_vals = _interp_r_multilinear_2d(r_grid, centers, x_data)
 
-        if d == 2:
-            r_vals = r_grid[idxs[0], idxs[1]]
-        else:
-            r_vals = r_grid[tuple(idxs)]
-
-        log_correction = torch.log(r_vals.clamp_min(eps)) - torch.log(Z)
+        log_correction = torch.log(r_vals.clamp_min(float(alpha))) - torch.log(Z)
         return logpdf_kde + log_correction
 
 
@@ -414,14 +477,15 @@ if __name__ == "__main__":
     # plt.show()
 
     # Optionally, define per-dim bandwidths (for example, pre-determined)
-    h_vec = torch.tensor([200.0, 0.02])  # in same units as your observables
 
     # Put everything into a dict
     hist_ref = {
         "edges": [Pmu_edges, CosThetamu_edges],
         "counts": hist.hist,
-        "h_vec": h_vec,  # optional; can be omitted if you want auto bandwidth
-        "alpha": 1e-6  # small pseudo-count to stabilize ratios
+        # "h_vec": torch.tensor([200.0, 0.02]),  # optional; can be omitted if you want auto bandwidth
+        "alpha": 1e-6,  # small pseudo-count to stabilize ratios
+        "smooth_sigma_bins": 1.0,  # try 0.8 to 1.5 (in bins)
+        "smooth_log": True  # smooth log(r) for stability
     }
 
     print("Calculating PDF")
@@ -450,6 +514,7 @@ if __name__ == "__main__":
                    shading="auto", cmap="magma",
                    norm=LogNorm(
                        vmin=1,
+                       vmax=np.max(max_hist)
                        # vmax=float(f.max())
                    )
                    )
