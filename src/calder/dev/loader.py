@@ -164,8 +164,8 @@ if __name__ == "__main__":
     t1 = time.perf_counter()
     print(f"To device: {t1 - t0:.3f} s")
 
-    Pmu_edges = torch.linspace(100, 5000, 51)
-    CosThetamu_edges = torch.linspace(0, 1, 51)
+    Pmu_edges = torch.linspace(100, 5000, 101)
+    CosThetamu_edges = torch.linspace(0, 1, 101)
 
     # Create and fill 2D histogram
     hist = Histogram(["Pmu", "CosThetamu"], [Pmu_edges, CosThetamu_edges])
@@ -235,9 +235,6 @@ if __name__ == "__main__":
     import math
     import torch
     import torch.nn.functional as F
-
-    import torch.nn.functional as F
-
 
     def _gauss_kernel_1d(sigma_bins: float, max_bins: int, device, dtype):
         # sigma_bins is in "bins". Limit it so that radius <= max_bins - 1
@@ -530,9 +527,9 @@ if __name__ == "__main__":
     plt.pcolormesh(P, C, np.clip(f.numpy(), 1e-12, None),
                    shading="auto", cmap="magma",
                    norm=LogNorm(
-                       vmin=1,
+                       # vmin=1,
                        # vmax=np.max(max_hist)*0.9
-                       vmax=float(f.max())
+                       # vmax=float(f.max())
                    )
                    )
     # plt.scatter(x_mc["Pmu"]["data"].cpu(), x_mc["CosThetamu"]["data"].cpu(),
